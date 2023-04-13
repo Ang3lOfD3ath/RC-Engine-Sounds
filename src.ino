@@ -173,8 +173,8 @@ const uint8_t PWM_PINS[PWM_CHANNELS_NUM] = { 13, 12, 14, 27, 35, 34 };  // Input
 
 #define STEERING_PIN 13  // CH1 output for steering servo (bus communication only)
 #define SHIFTING_PIN 12  // CH2 output for shifting servo (bus communication only)
-#define WINCH_PIN 14     // CH3 output for winch servo (bus communication only)
-#define COUPLER_PIN 27   // CH4 output for coupler (5th. wheel) servo (bus communication only)
+#define WINCH1_PIN 14   // CH3 output for winch1 servo (SBUS communication only)
+#define WINCH2_PIN 27   // CH4 output for winch2 servo (SBUS communication only)
 
 #ifdef PROTOTYPE_36      // switching headlight pin depending on the board variant (do not uncomment it, or it will cause boot issues!)
 #define HEADLIGHT_PIN 0  // White headllights connected to pin D0, which only exists on the 36 pin ESP32 board (causes boot issues, if used!)
@@ -197,8 +197,6 @@ const uint8_t PWM_PINS[PWM_CHANNELS_NUM] = { 13, 12, 14, 27, 35, 34 };  // Input
 
 #if defined THIRD_BRAKELIGHT
 #define BRAKELIGHT_PIN 32  // Upper brake lights
-#else
-#define COUPLER_SWITCH_PIN 32  // switch for trailer coupler sound
 #endif
 
 #define SHAKER_MOTOR_PIN 23  // Shaker motor (shaking truck while idling and engine start / stop)
@@ -314,9 +312,6 @@ IBusBM iBus;  // IBUS object
 bool ibusInit;
 uint32_t maxIbusRpmPercentage = 320;  // Limit required to prevent controller from crashing @ high engine RPM (was 350, but sometimes crashing)
 
-// Interrupt latches
-volatile boolean couplerSwitchInteruptLatch;  // this is enabled, if the coupler switch pin change interrupt is detected
-
 // Control input signals
 #define PULSE_ARRAY_SIZE 14                 // 13 channels (+ the unused CH0)
 uint16_t pulseWidthRaw[PULSE_ARRAY_SIZE];   // Current RC signal RAW pulse width [X] = channel number
@@ -352,6 +347,8 @@ boolean winchPull;
 boolean winchRelease;
 
 boolean winchEnabled;
+boolean winch1;
+boolean winch2;
 
 // Sound
 volatile boolean engineOn = false;                 // Signal for engine on / off
@@ -1219,16 +1216,7 @@ void IRAM_ATTR readPpm() {
   }
 }
 
-//
-// =======================================================================================================
-// TRAILER PRESENCE SWITCH INTERRUPT (not usable with third brake light or RZ7886 motor driver)
-// =======================================================================================================
-//
-#if not defined THIRD_BRAKELIGHT and not defined RZ7886_DRIVER_MODE
-void IRAM_ATTR trailerPresenceSwitchInterrupt() {
-  couplerSwitchInteruptLatch = true;
-}
-#endif
+
 
 //
 // =======================================================================================================
@@ -1267,8 +1255,8 @@ void setupMcpwm() {
   // 1. set our servo output pins
   mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0A, STEERING_PIN);  //Set steering as PWM0A
   mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM0B, SHIFTING_PIN);  //Set shifting as PWM0B
-  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1A, COUPLER_PIN);   //Set coupling as PWM1A
-  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1B, WINCH_PIN);     //Set winch  or beacon as PWM1B
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1A, WINCH1_PIN);   //Set winch as PWM1A
+  mcpwm_gpio_init(MCPWM_UNIT_0, MCPWM1B, WINCH2_PIN);     //Set winch  or beacon as PWM1B
 
   // 2. configure MCPWM parameters
   mcpwm_config_t pwm_config;
@@ -1515,10 +1503,7 @@ void setup() {
   pinMode(COMMAND_RX, INPUT_PULLDOWN);
 
 
-#if not defined THIRD_BRAKELIGHT and not defined RZ7886_DRIVER_MODE  // If a third brakelight is not defined and RZ7886 motor driver is not defined, pin 32 for the trailer presence switch
-  pinMode(COUPLER_SWITCH_PIN, INPUT_PULLUP);
-  attachInterrupt(digitalPinToInterrupt(COUPLER_SWITCH_PIN), trailerPresenceSwitchInterrupt, CHANGE);
-#endif
+
 
   // LED & shaker motor setup (note, that we only have timers from 0 - 15, but 0 - 1 are used for interrupts!)
   headLight.begin(HEADLIGHT_PIN, 15, 20000);            // Timer 15, 20kHz
@@ -2237,8 +2222,8 @@ void mcpwmOutput() {
   static unsigned long winchDelayMicros;
   if (micros() - winchDelayMicros > winchDelayTarget) {
     winchDelayMicros = micros();
-    if (winchPull) winchServoMicrosTarget = CH4L;
-    else if (winchRelease) winchServoMicrosTarget = CH4R;
+    if (winch2) winchServoMicrosTarget = CH4L;
+    else if (winch1) winchServoMicrosTarget = CH4R;
     else winchServoMicrosTarget = CH4C;
     if (winchServoMicros < winchServoMicrosTarget) winchServoMicros++;
     if (winchServoMicros > winchServoMicrosTarget) winchServoMicros--;
@@ -2274,33 +2259,19 @@ void mcpwmOutput() {
   }
 #endif
 
-  // Trailer coupler (5th wheel) CH4 **********************
-  static uint16_t couplerServoMicros;
-  if (unlock5thWheel) couplerServoMicros = CH3R;
-  else couplerServoMicros = CH3L;
-  mcpwm_set_duty_in_us(MCPWM_UNIT_0, MCPWM_TIMER_1, MCPWM_OPR_A, couplerServoMicros);
-
   // Print servo signal debug infos **********************
   static unsigned long printServoMillis;
 #ifdef SERVO_DEBUG                           // can slow down the playback loop!
   if (millis() - printServoMillis > 10000) {  // Every 1000ms
     printServoMillis = millis();
-
     Serial.printf("SERVO_DEBUG:\n");
     Serial.printf("CH1 (steering) :  %i µS, %.2f°\n", steeringServoMicrosDelayed, us2degree(steeringServoMicrosDelayed));
     Serial.printf("CH2 (shifting) :  %i µS, %.2f°\n", shiftingServoMicros, us2degree(shiftingServoMicros));
 
-#if defined MODE2_WINCH
-    Serial.printf("CH3 (winch)    :  %i µS, %f°\n", winchServoMicros, us2degree(winchServoMicros));
-#endif
-
 #if defined CH3_BEACON
     Serial.printf("CH3 (beacon)    :  %i µS, %f°\n", beaconServoMicros, us2degree(beaconServoMicros));
 #endif
-
-    Serial.printf("CH4 (5th wheel):  %i µS, %.2f°\n", couplerServoMicros, us2degree(couplerServoMicros));
-    Serial.printf("-------------------------------------\n");
-  }
+}
 #endif  // SERVO_DEBUG
 }
 
@@ -3561,13 +3532,13 @@ unsigned long loopDuration() {
 
 void triggerHorn() {
 
-  if (!winchEnabled && !unlock5thWheel && !hazard) {  // Horn & siren control mode *************
+  if (!winchEnabled && !hazard) {  // Horn & siren control mode *************
     winchPull = false;
     winchRelease = false;
-    legsUp = false;
-    legsDown = false;
-    rampsUp = false;
-    rampsDown = false;
+    //legsUp = false;
+    //legsDown = false;
+    //rampsUp = false;
+    //rampsDown = false;
 
     // detect horn trigger ( impulse length > 1900us) -------------
     if (pulseWidth[4] > 1900 && pulseWidth[4] < pulseMaxLimit[4]) {
@@ -3576,77 +3547,30 @@ void triggerHorn() {
     } else {
       hornTrigger = false;
     }
-
-#if not defined EXCAVATOR_MODE
-#ifndef NO_SIREN
-    // detect siren trigger ( impulse length < 1100us) ----------
-    if (pulseWidth[4] < 1100 && pulseWidth[4] > pulseMinLimit[4]) {
-      sirenTrigger = true;
-      sirenLatch = true;
-    } else {
-      sirenTrigger = false;
-    }
-#endif
-#endif
-
-    // detect bluelight trigger ( impulse length < 1300us) ----------
-    static uint32_t bluelightOffDelay = millis();
-    if ((pulseWidth[4] < 1300 && pulseWidth[4] > pulseMinLimit[4]) || sirenLatch) {
-      bluelightOffDelay = millis();
-      blueLightTrigger = true;
-    }
-    if (millis() - bluelightOffDelay > 50) {  // Switch off delay
-      blueLightTrigger = false;
-    }
   }
-
-  else if (unlock5thWheel) {  // Trailer leg control mode *************************************
-    winchPull = false;
-    winchRelease = false;
-    rampsUp = false;
-    rampsDown = false;
-
-    // legs down ( impulse length > 1900us) -------------
-    if (pulseWidth[4] > 1900 && pulseWidth[4] < pulseMaxLimit[4]) legsDown = true;
-    else legsDown = false;
-
-
-    // legs up ( impulse length < 1100us) -------------
-    if (pulseWidth[4] < 1100 && pulseWidth[4] > pulseMinLimit[4]) legsUp = true;
-    else legsUp = false;
-  }
-
-  else if (hazard) {  // Trailer ramps control mode ***************************************
-    winchPull = false;
-    winchRelease = false;
-    legsUp = false;
-    legsDown = false;
-
-    // ramps down ( impulse length > 1900us) -------------
-    if (pulseWidth[4] > 1900 && pulseWidth[4] < pulseMaxLimit[4]) rampsDown = true;
-    else rampsDown = false;
-
-
-    // ramps up ( impulse length < 1100us) -------------
-    if (pulseWidth[4] < 1100 && pulseWidth[4] > pulseMinLimit[4]) rampsUp = true;
-    else rampsUp = false;
-  }
-
   else {  // Winch control mode *****************************************************************
-    legsUp = false;
-    legsDown = false;
-    rampsUp = false;
-    rampsDown = false;
+    //legsUp = false;
+    //legsDown = false;
+    //rampsUp = false;
+    //rampsDown = false;
 
-    // pull winch ( impulse length > 1900us) -------------
-    if (pulseWidth[4] > 1900 && pulseWidth[4] < pulseMaxLimit[4]) winchPull = true;
-    else winchPull = false;
-
-    // release winch ( impulse length < 1100us) -------------
-    if (pulseWidth[4] < 1100 && pulseWidth[4] > pulseMinLimit[4]) winchRelease = true;
-    else winchRelease = false;
+    // check throttle channel for winch control
+    if (!winch1 && pulseWidth[2] > 1500) { // if throttle is high, pull winch 1
+      winchPull = true;
+    } else if (!winch1 && pulseWidth[2] < 1000) { // if throttle is low, release winch 1
+      winchRelease = true;
+    } else if (!winch2 && pulseWidth[2] > 1500) { // if throttle is high, pull winch 2
+      winchPull = true;
+    } else if (!winch2 && pulseWidth[2] < 1000) { // if throttle is low, release winch 2
+      winchRelease = true;
+    } else { // if throttle is in the middle, do not move winch
+      winchPull = false;
+      winchRelease = false;
+    }
   }
+
 }
+
 
 //
 // =======================================================================================================
@@ -3819,14 +3743,7 @@ void rcTriggerRead() {
   if (mode2) winchEnabled = true;
   else winchEnabled = false;
 
-#elif defined MODE2_TRAILER_UNLOCKING  // 5th wheel unlocking mode
-  static bool fifthWheelStateLock2;
-  if (driveState == 0) {  // Only allow change, if vehicle stopped!
-    if (mode2 != fifthWheelStateLock2) {
-      unlock5thWheel = !unlock5thWheel;
-      fifthWheelStateLock2 = !fifthWheelStateLock2;
-    }
-  }
+
 
 #else  // Sound 1 triggering mode
   if (mode2) sound1trigger = true;  //Trigger sound 1 (It is reset after playback is done
@@ -3861,30 +3778,7 @@ void rcTriggerRead() {
 // =======================================================================================================
 //
 
-void trailerPresenceSwitchRead() {
-#if not defined THIRD_BRAKELIGHT and not defined RZ7886_DRIVER_MODE
-  static unsigned long switchMillis;
-  static boolean couplerSwitchStateLatch;
 
-  if (couplerSwitchInteruptLatch) {
-    switchMillis = millis();
-    couplerSwitchInteruptLatch = false;
-    couplerSwitchStateLatch = true;
-  }
-
-  if (couplerSwitchStateLatch && millis() - switchMillis > 10) {  // Debouncing delay
-    if (digitalRead(COUPLER_SWITCH_PIN)) {
-      couplingTrigger = true;
-      trailerDetected = true;
-      couplerSwitchStateLatch = false;
-    } else {
-      uncouplingTrigger = true;
-      trailerDetected = false;
-      couplerSwitchStateLatch = false;
-    }
-  }
-#endif
-}
 
 //
 // =======================================================================================================
@@ -4499,11 +4393,6 @@ void loop() {
 #endif
     xSemaphoreGive(xRpmSemaphore);  // Now free or "Give" the semaphore for others.
   }
-
-  // Read trailer switch state
-#if not defined THIRD_BRAKELIGHT and not defined RZ7886_DRIVER_MODE
-  trailerPresenceSwitchRead();
-#endif
 
   // RGB LED control
 #if defined NEOPIXEL_ENABLED
